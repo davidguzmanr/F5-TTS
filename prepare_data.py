@@ -32,6 +32,7 @@ from pathlib import Path
 import pandas as pd
 import soundfile as sf
 import yaml
+from tqdm import tqdm
 
 
 SAMPLING_RATE = 24000
@@ -46,6 +47,7 @@ DEFAULT_NUM_WORKERS = 4
 DEFAULT_NUM_GPUS = 1
 DEFAULT_GRAD_ACCUMULATION = 1
 DEFAULT_WORKERS = 4
+DEFAULT_MAX_DURATION = 15.0
 
 BASE_CONFIG = "F5TTS_v1_Base.yaml"
 CONFIGS_DIR = Path("src/f5_tts/configs")
@@ -56,7 +58,7 @@ def slugify(language: str) -> str:
     return f"open-bible-{language.lower()}"
 
 
-def create_metadata(language: str, dataset_base: str, data_dir: Path) -> pd.DataFrame:
+def create_metadata(language: str, dataset_base: str, data_dir: Path, max_duration: float) -> pd.DataFrame:
     """Read train.tsv and write metadata.csv in the format expected by prepare_csv_wavs.py."""
     src = Path(dataset_base) / language
     tsv_path = src / "train.tsv"
@@ -72,6 +74,14 @@ def create_metadata(language: str, dataset_base: str, data_dir: Path) -> pd.Data
     train.columns = ["audio_file", "text"]
     train["audio_file"] = train["audio_file"].apply(lambda x: str(wav_dir / x))
 
+    total_before = len(train)
+    if max_duration > 0:
+        durations = train["audio_file"].apply(lambda p: sf.info(p).duration)
+        train = train[durations <= max_duration].reset_index(drop=True)
+        n_filtered = total_before - len(train)
+        if n_filtered > 0:
+            print(f"  Filtered {n_filtered}/{total_before} samples exceeding {max_duration}s")
+
     data_dir.mkdir(parents=True, exist_ok=True)
     csv_path = data_dir / "metadata.csv"
     train.to_csv(csv_path, index=False, sep="|")
@@ -80,11 +90,11 @@ def create_metadata(language: str, dataset_base: str, data_dir: Path) -> pd.Data
     return train
 
 
-def download_from_huggingface(language: str, hf_repo: str, data_dir: Path) -> pd.DataFrame:
+def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_duration: float) -> pd.DataFrame:
     """Download a language dataset from Hugging Face and write wav files + metadata.csv."""
     from datasets import Audio, load_dataset
 
-    print(f"  Loading {hf_repo} / {language} from Hugging Face...")
+    print(f"  Loading {hf_repo}/{language} from Hugging Face...")
     ds = load_dataset(hf_repo, language)
 
     wavs_dir = data_dir / "wavs"
@@ -93,7 +103,8 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path) -> pd
     subset = ds["train"].cast_column("audio", Audio(decode=False))
 
     rows = []
-    for i in range(len(subset)):
+    n_filtered = 0
+    for i in tqdm(range(len(subset)), desc=f"Downloading {language} wav files"):
         sample = subset[i]
 
         testament = sample["testament"].replace(" ", "-")
@@ -103,11 +114,19 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path) -> pd
         filename = f"{testament}-{book}-{chapter}-{verse}.wav"
 
         wav_path = wavs_dir / filename
+        audio_data, sr = sf.read(BytesIO(sample["audio"]["bytes"]))
+
+        if max_duration > 0 and len(audio_data) / sr > max_duration:
+            n_filtered += 1
+            continue
+
         if not wav_path.exists():
-            audio_data, sr = sf.read(BytesIO(sample["audio"]["bytes"]))
             sf.write(str(wav_path), audio_data, sr)
 
         rows.append({"audio_file": str(wav_path.resolve()), "text": sample["text"]})
+
+    if n_filtered > 0:
+        print(f"  Filtered {n_filtered}/{len(subset)} samples exceeding {max_duration}s")
 
     metadata = pd.DataFrame(rows)
     csv_path = data_dir / "metadata.csv"
@@ -305,6 +324,7 @@ def prepare_language(
     language: str,
     dataset_base: str | None,
     hf_repo: str,
+    max_duration: float,
     target_updates: int,
     batch_size_per_gpu: int,
     max_samples: int,
@@ -325,10 +345,10 @@ def prepare_language(
 
     if dataset_base:
         print("\n[1/5] Creating metadata CSV from local data...")
-        create_metadata(language, dataset_base, data_dir)
+        create_metadata(language, dataset_base, data_dir, max_duration)
     else:
         print(f"\n[1/5] Downloading from Hugging Face ({hf_repo})...")
-        download_from_huggingface(language, hf_repo, data_dir)
+        download_from_huggingface(language, hf_repo, data_dir, max_duration)
 
     if not skip_preprocess:
         print("\n[2/5] Running preprocessing (prepare_csv_wavs.py)...")
@@ -381,6 +401,12 @@ def main():
         "--hf-repo",
         default=DEFAULT_HF_REPO,
         help=f"Hugging Face dataset repo (default: {DEFAULT_HF_REPO}). Used when --dataset-base is not set.",
+    )
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=DEFAULT_MAX_DURATION,
+        help=f"Discard audio files longer than this many seconds; 0 to disable (default: {DEFAULT_MAX_DURATION})",
     )
     parser.add_argument(
         "--target-updates",
@@ -448,6 +474,7 @@ def main():
             language=lang,
             dataset_base=args.dataset_base,
             hf_repo=args.hf_repo,
+            max_duration=args.max_duration,
             target_updates=args.target_updates,
             batch_size_per_gpu=args.batch_size_per_gpu,
             max_samples=args.max_samples,

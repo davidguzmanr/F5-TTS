@@ -4,13 +4,13 @@ hydra:
 
 datasets:
   name: open-bible-yoruba  # dataset name
-  batch_size_per_gpu: 28000
+  batch_size_per_gpu: 28000  # 8 GPUs, 8 * 38400 = 307200
   batch_size_type: frame  # frame | sample
   max_samples: 32  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
   num_workers: 4
 
 optim:
-  epochs: 575  # ~500k updates with batch_size_per_gpu=28000, 1 GPU (870 updates/epoch)
+  epochs: 546
   learning_rate: 7.5e-5
   num_warmup_updates: 20000  # warmup updates
   grad_accumulation_steps: 1  # note: updates = steps / grad_accumulation_steps
