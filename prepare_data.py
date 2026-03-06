@@ -6,15 +6,15 @@ Automates all steps: metadata creation, preprocessing, vocab verification,
 training parameter estimation, and config generation.
 
 Usage:
-    # Single language
-    python prepare_data.py --dataset-base /path/to/bible-tts-resources --languages Yoruba
+    # Download from Hugging Face (default)
+    python prepare_data.py --languages Yoruba
+    python prepare_data.py --languages Yoruba Ewe Hausa
 
-    # Multiple languages
-    python prepare_data.py --dataset-base /path/to/bible-tts-resources --languages Yoruba Ewe Hausa
+    # Use a local dataset directory instead
+    python prepare_data.py --dataset-base /path/to/bible-tts-resources --languages Yoruba
 
     # Custom training settings
     python prepare_data.py \
-        --dataset-base /path/to/bible-tts-resources \
         --languages Yoruba \
         --target-updates 500000 \
         --num-gpus 1 \
@@ -26,9 +26,11 @@ import json
 import math
 import subprocess
 import sys
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
+import soundfile as sf
 import yaml
 
 
@@ -36,6 +38,7 @@ SAMPLING_RATE = 24000
 HOP_LENGTH = 256
 FRAMES_PER_SECOND = SAMPLING_RATE / HOP_LENGTH  # 93.75
 
+DEFAULT_HF_REPO = "davidguzmanr/open-bible-resources"
 DEFAULT_TARGET_UPDATES = 500_000
 DEFAULT_BATCH_SIZE_PER_GPU = 28_000
 DEFAULT_MAX_SAMPLES = 32
@@ -75,6 +78,43 @@ def create_metadata(language: str, dataset_base: str, data_dir: Path) -> pd.Data
     print(f"  Metadata: {csv_path} ({len(train)} samples)")
     print(f"  Wav dir:  {wav_dir}")
     return train
+
+
+def download_from_huggingface(language: str, hf_repo: str, data_dir: Path) -> pd.DataFrame:
+    """Download a language dataset from Hugging Face and write wav files + metadata.csv."""
+    from datasets import Audio, load_dataset
+
+    print(f"  Loading {hf_repo} / {language} from Hugging Face...")
+    ds = load_dataset(hf_repo, language)
+
+    wavs_dir = data_dir / "wavs"
+    wavs_dir.mkdir(parents=True, exist_ok=True)
+
+    subset = ds["train"].cast_column("audio", Audio(decode=False))
+
+    rows = []
+    for i in range(len(subset)):
+        sample = subset[i]
+
+        testament = sample["testament"].replace(" ", "-")
+        book = sample["book"].replace(" ", "-")
+        chapter = sample["chapter"]
+        verse = sample["verse"]
+        filename = f"{testament}-{book}-{chapter}-{verse}.wav"
+
+        wav_path = wavs_dir / filename
+        if not wav_path.exists():
+            audio_data, sr = sf.read(BytesIO(sample["audio"]["bytes"]))
+            sf.write(str(wav_path), audio_data, sr)
+
+        rows.append({"audio_file": str(wav_path.resolve()), "text": sample["text"]})
+
+    metadata = pd.DataFrame(rows)
+    csv_path = data_dir / "metadata.csv"
+    metadata.to_csv(csv_path, index=False, sep="|")
+    print(f"  Downloaded {len(rows)} samples to {wavs_dir}")
+    print(f"  Metadata: {csv_path}")
+    return metadata
 
 
 def run_preprocessing(data_dir: Path, out_dir: Path, workers: int):
@@ -263,7 +303,8 @@ def rewrite_config_with_hydra_header(
 
 def prepare_language(
     language: str,
-    dataset_base: str,
+    dataset_base: str | None,
+    hf_repo: str,
     target_updates: int,
     batch_size_per_gpu: int,
     max_samples: int,
@@ -282,8 +323,12 @@ def prepare_language(
     print(f"Preparing: {language} ({slug})")
     print(f"{'='*60}")
 
-    print("\n[1/5] Creating metadata CSV...")
-    create_metadata(language, dataset_base, data_dir)
+    if dataset_base:
+        print("\n[1/5] Creating metadata CSV from local data...")
+        create_metadata(language, dataset_base, data_dir)
+    else:
+        print(f"\n[1/5] Downloading from Hugging Face ({hf_repo})...")
+        download_from_huggingface(language, hf_repo, data_dir)
 
     if not skip_preprocess:
         print("\n[2/5] Running preprocessing (prepare_csv_wavs.py)...")
@@ -329,8 +374,13 @@ def main():
     )
     parser.add_argument(
         "--dataset-base",
-        required=True,
-        help="Base path containing language directories (e.g. /path/to/bible-tts-resources)",
+        default=None,
+        help="Base path containing language directories. If not provided, data is downloaded from Hugging Face.",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        default=DEFAULT_HF_REPO,
+        help=f"Hugging Face dataset repo (default: {DEFAULT_HF_REPO}). Used when --dataset-base is not set.",
     )
     parser.add_argument(
         "--target-updates",
@@ -381,17 +431,23 @@ def main():
     )
     args = parser.parse_args()
 
-    available = [d.name for d in Path(args.dataset_base).iterdir() if d.is_dir()]
-    for lang in args.languages:
-        if lang not in available:
-            print(f"ERROR: Language '{lang}' not found in {args.dataset_base}")
-            print(f"  Available: {', '.join(sorted(available))}")
+    if args.dataset_base:
+        base = Path(args.dataset_base)
+        if not base.is_dir():
+            print(f"ERROR: --dataset-base directory not found: {base}")
             sys.exit(1)
+        available = [d.name for d in base.iterdir() if d.is_dir()]
+        for lang in args.languages:
+            if lang not in available:
+                print(f"ERROR: Language '{lang}' not found in {args.dataset_base}")
+                print(f"  Available: {', '.join(sorted(available))}")
+                sys.exit(1)
 
     for lang in args.languages:
         prepare_language(
             language=lang,
             dataset_base=args.dataset_base,
+            hf_repo=args.hf_repo,
             target_updates=args.target_updates,
             batch_size_per_gpu=args.batch_size_per_gpu,
             max_samples=args.max_samples,
