@@ -62,6 +62,8 @@ def main(model_cfg):
         wandb_resume_id=wandb_resume_id,
         last_per_updates=model_cfg.ckpts.last_per_updates,
         log_samples=model_cfg.ckpts.log_samples,
+        log_samples_per_updates=model_cfg.ckpts.get("log_samples_per_updates", 5000),
+        log_samples_count=model_cfg.ckpts.get("log_samples_count", 3),
         bnb_optimizer=model_cfg.optim.bnb_optimizer,
         mel_spec_type=mel_spec_type,
         is_local_vocoder=model_cfg.model.vocoder.is_local,

@@ -45,6 +45,8 @@ class Trainer:
         wandb_run_name="test_run",
         wandb_resume_id: str = None,
         log_samples: bool = False,
+        log_samples_per_updates: int = 5000,
+        log_samples_count: int = 3,  # number of fixed dataset samples to synthesize for TensorBoard
         last_per_updates=None,
         accelerate_kwargs: dict = dict(),
         ema_kwargs: dict = dict(),
@@ -59,6 +61,8 @@ class Trainer:
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
         self.log_samples = log_samples
+        self.log_samples_per_updates = log_samples_per_updates
+        self.log_samples_count = log_samples_count
 
         self.accelerator = Accelerator(
             log_with=logger if logger == "wandb" else None,
@@ -273,6 +277,30 @@ class Trainer:
             log_samples_path = f"{self.checkpoint_path}/samples"
             os.makedirs(log_samples_path, exist_ok=True)
 
+        # Pre-process fixed dataset samples for periodic TensorBoard audio logging.
+        # dataset[0] is used as the reference voice for all; dataset[0..N-1] supply the gen texts.
+        processed_refs = []
+        if self.log_samples and self.is_main:
+            ref_sample = train_dataset[0]
+            ref_mel = ref_sample["mel_spec"]  # [n_mel, T]
+            ref_mel = ref_mel.unsqueeze(0).permute(0, 2, 1).to(self.accelerator.device)  # [1, T, n_mel]
+            ref_text = ref_sample["text"]
+            for i in range(self.log_samples_count):
+                sample = train_dataset[i]
+                gen_text = sample["text"]
+                gt_mel = sample["mel_spec"].unsqueeze(0).to(self.accelerator.device)  # [1, n_mel, T]
+                with torch.inference_mode():
+                    if self.vocoder_name == "vocos":
+                        gt_audio = vocoder.decode(gt_mel).cpu()
+                    elif self.vocoder_name == "bigvgan":
+                        gt_audio = vocoder(gt_mel).squeeze(0).cpu()
+                processed_refs.append({
+                    "ref_mel": ref_mel,
+                    "ref_text": ref_text,
+                    "gen_text": gen_text,
+                    "gt_audio": gt_audio,
+                })
+
         if exists(resumable_with_seed):
             generator = torch.Generator()
             generator.manual_seed(resumable_with_seed)
@@ -436,6 +464,59 @@ class Trainer:
                             f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
                         )
                         self.model.train()
+
+                if (
+                    global_update % self.log_samples_per_updates == 0
+                    and self.accelerator.sync_gradients
+                    and self.is_main
+                    and processed_refs
+                ):
+                    self.model.eval()
+                    for i, ref_item in enumerate(processed_refs):
+                        ref_mel = ref_item["ref_mel"]  # [1, T, n_mel]
+                        ref_audio_len = ref_mel.shape[1]
+                        ref_text = ref_item["ref_text"]
+                        gen_text = ref_item["gen_text"]
+                        sep = [" "] if isinstance(ref_text, list) else (" " if ref_text else "")
+                        infer_text = [ref_text + sep + gen_text]
+                        est_gen_len = int(ref_audio_len * len(gen_text) / max(len(ref_text), 1))
+                        duration = ref_audio_len + max(est_gen_len, ref_audio_len // 2)
+                        with torch.inference_mode(), self.accelerator.autocast():
+                            generated, _ = self.accelerator.unwrap_model(self.model).sample(
+                                cond=ref_mel,
+                                text=infer_text,
+                                duration=duration,
+                                steps=nfe_step,
+                                cfg_strength=cfg_strength,
+                                sway_sampling_coef=sway_sampling_coef,
+                            )
+                            generated = generated.to(torch.float32)
+                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
+                            if self.vocoder_name == "vocos":
+                                gen_audio = vocoder.decode(gen_mel_spec).cpu()
+                            elif self.vocoder_name == "bigvgan":
+                                gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
+                        torchaudio.save(
+                            f"{log_samples_path}/update_{global_update}_fixed_{i}.wav",
+                            gen_audio,
+                            target_sample_rate,
+                        )
+                        if self.logger == "tensorboard" and self.writer is not None:
+                            self.writer.add_audio(
+                                f"fixed_sample_{i}/generated",
+                                gen_audio,
+                                global_step=global_update,
+                                sample_rate=target_sample_rate,
+                            )
+                            self.writer.add_audio(
+                                f"fixed_sample_{i}/ground_truth",
+                                ref_item["gt_audio"],
+                                global_step=global_update,
+                                sample_rate=target_sample_rate,
+                            )
+                    if self.logger == "tensorboard" and self.writer is not None:
+                        self.writer.flush()
+                    self.model.train()
 
         self.save_checkpoint(global_update, last=True)
 
