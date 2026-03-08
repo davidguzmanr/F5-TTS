@@ -216,21 +216,26 @@ def estimate_training_params(
         num_batches += 1
 
     total_frames = sum(durations) * FRAMES_PER_SECOND
-    updates_per_epoch = math.ceil(num_batches / (num_gpus * grad_accumulation_steps))
-    epochs = math.ceil(target_updates / updates_per_epoch)
+    single_gpu_updates_per_epoch = math.ceil(num_batches / grad_accumulation_steps)
+    multi_gpu_updates_per_epoch = math.ceil(num_batches / (num_gpus * grad_accumulation_steps))
+    epochs = math.ceil(target_updates / single_gpu_updates_per_epoch)
     utilization = total_frames / num_batches / batch_size_per_gpu * 100
 
     result = {
         "num_batches": num_batches,
-        "updates_per_epoch": updates_per_epoch,
+        "updates_per_epoch": multi_gpu_updates_per_epoch,
         "epochs": epochs,
         "avg_batch_utilization": utilization,
     }
 
     print(f"  Batches per epoch: {num_batches}")
     print(f"  Avg batch utilization: {utilization:.1f}%")
-    print(f"  Updates per epoch: {updates_per_epoch}")
-    print(f"  Target updates: {target_updates} -> epochs: {epochs}")
+    print(f"  Updates/epoch (1 GPU): {single_gpu_updates_per_epoch}")
+    print(f"  Updates/epoch ({num_gpus} GPUs): {multi_gpu_updates_per_epoch}")
+    print(f"  Target updates (1-GPU equivalent): {target_updates} -> epochs: {epochs}")
+    if num_gpus > 1:
+        actual_updates = multi_gpu_updates_per_epoch * epochs
+        print(f"  Actual optimizer updates with {num_gpus} GPUs: ~{actual_updates} (effective batch size {num_gpus}x)")
     return result
 
 
