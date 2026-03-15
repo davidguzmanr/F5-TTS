@@ -6,9 +6,17 @@ Automates all steps: metadata creation, preprocessing, vocab verification,
 training parameter estimation, and config generation.
 
 Usage:
-    # Download from Hugging Face (default)
+    # Single language (monolingual, custom tokenizer)
     python prepare_data.py --languages Yoruba
+
+    # Single language with pinyin tokenizer
+    python prepare_data.py --languages Yoruba --tokenizer pinyin
+
+    # Multiple languages (each trained separately)
     python prepare_data.py --languages Yoruba Ewe Hausa
+
+    # Multilingual (combine languages into one dataset)
+    python prepare_data.py --languages Swahili Chichewa Matengo --multilingual
 
     # Use a local dataset directory instead
     python prepare_data.py --dataset-base /path/to/bible-tts-resources --languages Yoruba
@@ -56,6 +64,11 @@ CONFIGS_DIR = Path("src/f5_tts/configs")
 def slugify(language: str) -> str:
     """Convert language name to a dataset slug, e.g. 'Yoruba' -> 'open-bible-yoruba'."""
     return f"open-bible-{language.lower()}"
+
+
+def multilingual_slug(languages: list[str]) -> str:
+    """Create a slug for multilingual dataset"""
+    return "open-bible-" + "-".join(lang.lower() for lang in sorted(languages))
 
 
 def create_metadata(language: str, dataset_base: str, data_dir: Path, max_duration: float) -> pd.DataFrame:
@@ -136,7 +149,7 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_d
     return metadata
 
 
-def run_preprocessing(data_dir: Path, out_dir: Path, workers: int):
+def run_preprocessing(data_dir: Path, out_dir: Path, workers: int, tokenizer: str):
     """Run prepare_csv_wavs.py to produce raw.arrow, duration.json, vocab.txt."""
     csv_path = data_dir / "metadata.csv"
     cmd = [
@@ -144,10 +157,11 @@ def run_preprocessing(data_dir: Path, out_dir: Path, workers: int):
         "src/f5_tts/train/datasets/prepare_csv_wavs.py",
         str(csv_path),
         str(out_dir),
-        "--pretrain",
         "--workers",
         str(workers),
     ]
+    if tokenizer == "custom":
+        cmd.append("--pretrain")
     print(f"  Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
     print(f"  Preprocessed data saved to: {out_dir}")
@@ -245,6 +259,7 @@ def generate_config(
     batch_size_per_gpu: int,
     max_samples: int,
     num_workers: int,
+    tokenizer: str,
 ) -> Path:
     """Generate a training YAML config from the base config."""
     base_path = CONFIGS_DIR / BASE_CONFIG
@@ -261,13 +276,10 @@ def generate_config(
     config["ckpts"]["logger"] = "tensorboard"
     config["ckpts"]["save_per_updates"] = 10_000
     config["ckpts"]["keep_last_n_checkpoints"] = 5
-    # Remove wandb keys if present
     config["ckpts"].pop("wandb_project", None)
     config["ckpts"].pop("wandb_run_name", None)
     config["ckpts"].pop("wandb_resume_id", None)
 
-    config_name = f"F5TTS_v1_Base_{slug.replace('-', '_').title().replace('_', '_')}.yaml"
-    # Produce a cleaner name: F5TTS_v1_Base_Open_Bible_{Language}.yaml
     lang = slug.replace("open-bible-", "").title()
     config_name = f"F5TTS_v1_Base_Open_Bible_{lang}.yaml"
     config_path = CONFIGS_DIR / config_name
@@ -275,8 +287,7 @@ def generate_config(
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
-    # Re-read and add the hydra header (yaml.dump doesn't preserve it well)
-    rewrite_config_with_hydra_header(config_path, slug, epochs, batch_size_per_gpu, max_samples, num_workers)
+    rewrite_config_with_hydra_header(config_path, slug, epochs, batch_size_per_gpu, max_samples, num_workers, tokenizer)
 
     print(f"  Config: {config_path}")
     return config_path
@@ -289,6 +300,7 @@ def rewrite_config_with_hydra_header(
     batch_size_per_gpu: int,
     max_samples: int,
     num_workers: int,
+    tokenizer: str,
 ):
     """Write a clean config with proper hydra interpolation syntax."""
     base_path = CONFIGS_DIR / BASE_CONFIG
@@ -305,6 +317,12 @@ def rewrite_config_with_hydra_header(
         "  save_per_updates: 50000": "  save_per_updates: 10000",
         "  keep_last_n_checkpoints: -1": "  keep_last_n_checkpoints: 5",
     }
+
+    if tokenizer == "custom":
+        vocab_path = f"data/{slug}_custom/vocab.txt"
+        replacements["  tokenizer: pinyin"] = "  tokenizer: custom"
+        replacements["  tokenizer_path: null"] = f"  tokenizer_path: {vocab_path}"
+
     skip_keys = ["wandb_project:", "wandb_run_name:", "wandb_resume_id:"]
 
     new_lines = []
@@ -338,14 +356,16 @@ def prepare_language(
     num_workers: int,
     workers: int,
     skip_preprocess: bool,
+    tokenizer: str,
 ):
     """Full preparation pipeline for one language."""
     slug = slugify(language)
     data_dir = Path("data") / slug
-    out_dir = Path("data") / f"{slug}_pinyin"
+    out_dir = Path("data") / f"{slug}_{tokenizer}"
 
     print(f"\n{'='*60}")
     print(f"Preparing: {language} ({slug})")
+    print(f"Tokenizer: {tokenizer}")
     print(f"{'='*60}")
 
     if dataset_base:
@@ -357,7 +377,7 @@ def prepare_language(
 
     if not skip_preprocess:
         print("\n[2/5] Running preprocessing (prepare_csv_wavs.py)...")
-        run_preprocessing(data_dir, out_dir, workers)
+        run_preprocessing(data_dir, out_dir, workers, tokenizer)
     else:
         print("\n[2/5] Skipping preprocessing (--skip-preprocess)")
         if not out_dir.exists():
@@ -374,11 +394,94 @@ def prepare_language(
     )
 
     print("\n[5/5] Generating training config...")
-    config_path = generate_config(slug, params["epochs"], batch_size_per_gpu, max_samples, num_workers)
+    config_path = generate_config(slug, params["epochs"], batch_size_per_gpu, max_samples, num_workers, tokenizer)
 
     print(f"\n{'─'*60}")
     print(f"Done: {language}")
     print(f"  Data dir:    {data_dir}")
+    print(f"  Prepared:    {out_dir}")
+    print(f"  Config:      {config_path}")
+    print(f"  Train cmd:   accelerate launch --mixed_precision bf16 src/f5_tts/train/train.py --config-name {config_path.name}")
+    print(f"{'─'*60}")
+
+
+def prepare_multilingual(
+    languages: list[str],
+    dataset_base: str | None,
+    hf_repo: str,
+    max_duration: float,
+    target_updates: int,
+    batch_size_per_gpu: int,
+    max_samples: int,
+    num_gpus: int,
+    grad_accumulation_steps: int,
+    num_workers: int,
+    workers: int,
+    skip_preprocess: bool,
+    tokenizer: str,
+):
+    """Full preparation pipeline for multilingual training."""
+    slug = multilingual_slug(languages)
+    combined_data_dir = Path("data") / slug
+    out_dir = Path("data") / f"{slug}_{tokenizer}"
+
+    print(f"\n{'='*60}")
+    print(f"Preparing multilingual: {', '.join(languages)}")
+    print(f"Slug: {slug}")
+    print(f"Tokenizer: {tokenizer}")
+    print(f"{'='*60}")
+
+    # Step 1: Download/prepare each language
+    print(f"\n[1/6] Downloading {len(languages)} languages...")
+    all_metadata = []
+    for language in languages:
+        lang_data_dir = Path("data") / slugify(language)
+        print(f"\n  --- {language} ---")
+        if dataset_base:
+            metadata = create_metadata(language, dataset_base, lang_data_dir, max_duration)
+        else:
+            metadata = download_from_huggingface(language, hf_repo, lang_data_dir, max_duration)
+        all_metadata.append(metadata)
+
+    # Step 2: Combine metadata CSVs
+    print(f"\n[2/6] Combining metadata from {len(languages)} languages...")
+    combined = pd.concat(all_metadata, ignore_index=True)
+    combined_data_dir.mkdir(parents=True, exist_ok=True)
+    combined_csv = combined_data_dir / "metadata.csv"
+    combined.to_csv(combined_csv, index=False, sep="|")
+    print(f"  Combined metadata: {combined_csv} ({len(combined)} samples)")
+    for lang, meta in zip(languages, all_metadata):
+        print(f"    {lang}: {len(meta)} samples")
+
+    # Step 3: Preprocess combined dataset
+    if not skip_preprocess:
+        print("\n[3/6] Running preprocessing on combined dataset...")
+        run_preprocessing(combined_data_dir, out_dir, workers, tokenizer)
+    else:
+        print("\n[3/6] Skipping preprocessing (--skip-preprocess)")
+        if not out_dir.exists():
+            print(f"  WARNING: {out_dir} does not exist. Run without --skip-preprocess first.")
+            return
+
+    # Step 4: Verify vocab
+    print("\n[4/6] Verifying vocabulary...")
+    verify_vocab(out_dir)
+
+    # Step 5: Compute training parameters
+    print("\n[5/6] Computing training parameters...")
+    durations = load_durations(out_dir)
+    params = estimate_training_params(
+        durations, batch_size_per_gpu, max_samples, num_gpus, grad_accumulation_steps, target_updates
+    )
+
+    # Step 6: Generate config
+    print("\n[6/6] Generating training config...")
+    config_path = generate_config(slug, params["epochs"], batch_size_per_gpu, max_samples, num_workers, tokenizer)
+
+    print(f"\n{'─'*60}")
+    print(f"Done: Multilingual ({', '.join(languages)})")
+    print(f"  Languages:   {', '.join(languages)}")
+    print(f"  Data dir:    {combined_data_dir}")
     print(f"  Prepared:    {out_dir}")
     print(f"  Config:      {config_path}")
     print(f"  Train cmd:   accelerate launch --mixed_precision bf16 src/f5_tts/train/train.py --config-name {config_path.name}")
@@ -396,6 +499,17 @@ def main():
         nargs="+",
         required=True,
         help="Language names matching directories in the dataset base path (e.g. Yoruba Ewe Hausa)",
+    )
+    parser.add_argument(
+        "--multilingual",
+        action="store_true",
+        help="Combine all languages into one multilingual dataset for training",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        choices=["custom", "pinyin"],
+        default="custom",
+        help="Tokenizer type: 'custom' builds vocab from dataset, 'pinyin' uses pretrained Chinese/English vocab (default: custom)",
     )
     parser.add_argument(
         "--dataset-base",
@@ -474,9 +588,12 @@ def main():
                 print(f"  Available: {', '.join(sorted(available))}")
                 sys.exit(1)
 
-    for lang in args.languages:
-        prepare_language(
-            language=lang,
+    if args.multilingual:
+        if len(args.languages) < 2:
+            print("ERROR: --multilingual requires at least 2 languages")
+            sys.exit(1)
+        prepare_multilingual(
+            languages=args.languages,
             dataset_base=args.dataset_base,
             hf_repo=args.hf_repo,
             max_duration=args.max_duration,
@@ -488,12 +605,30 @@ def main():
             num_workers=args.num_workers,
             workers=args.workers,
             skip_preprocess=args.skip_preprocess,
+            tokenizer=args.tokenizer,
         )
+    else:
+        for lang in args.languages:
+            prepare_language(
+                language=lang,
+                dataset_base=args.dataset_base,
+                hf_repo=args.hf_repo,
+                max_duration=args.max_duration,
+                target_updates=args.target_updates,
+                batch_size_per_gpu=args.batch_size_per_gpu,
+                max_samples=args.max_samples,
+                num_gpus=args.num_gpus,
+                grad_accumulation_steps=args.grad_accumulation_steps,
+                num_workers=args.num_workers,
+                workers=args.workers,
+                skip_preprocess=args.skip_preprocess,
+                tokenizer=args.tokenizer,
+            )
 
-    if len(args.languages) > 1:
-        print(f"\n{'='*60}")
-        print(f"All {len(args.languages)} languages prepared successfully.")
-        print(f"{'='*60}")
+        if len(args.languages) > 1:
+            print(f"\n{'='*60}")
+            print(f"All {len(args.languages)} languages prepared successfully.")
+            print(f"{'='*60}")
 
 
 if __name__ == "__main__":
