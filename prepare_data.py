@@ -71,7 +71,7 @@ def multilingual_slug(languages: list[str]) -> str:
     return "open-bible-" + "-".join(lang.lower() for lang in sorted(languages))
 
 
-def create_metadata(language: str, dataset_base: str, data_dir: Path, max_duration: float) -> pd.DataFrame:
+def create_metadata(language: str, dataset_base: str, data_dir: Path, max_duration: float, testament_filter: str | None = None) -> pd.DataFrame:
     """Read train.tsv and write metadata.csv in the format expected by prepare_csv_wavs.py."""
     src = Path(dataset_base) / language
     tsv_path = src / "train.tsv"
@@ -83,6 +83,12 @@ def create_metadata(language: str, dataset_base: str, data_dir: Path, max_durati
         raise FileNotFoundError(f"Wav directory not found: {wav_dir}")
 
     train = pd.read_csv(tsv_path, sep="\t")
+
+    if testament_filter and "testament" in train.columns:
+        total_before = len(train)
+        train = train[train["testament"] == testament_filter].reset_index(drop=True)
+        print(f"  Testament filter '{testament_filter}': {len(train)}/{total_before} samples kept")
+
     train = train[["filename", "text"]]
     train.columns = ["audio_file", "text"]
     train["audio_file"] = train["audio_file"].apply(lambda x: str(wav_dir / x))
@@ -103,7 +109,7 @@ def create_metadata(language: str, dataset_base: str, data_dir: Path, max_durati
     return train
 
 
-def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_duration: float) -> pd.DataFrame:
+def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_duration: float, testament_filter: str | None = None) -> pd.DataFrame:
     """Download a language dataset from Hugging Face and write wav files + metadata.csv."""
     from datasets import Audio, load_dataset
 
@@ -117,8 +123,13 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_d
 
     rows = []
     n_filtered = 0
+    n_testament_filtered = 0
     for i in tqdm(range(len(subset)), desc=f"Downloading {language} wav files"):
         sample = subset[i]
+
+        if testament_filter and sample["testament"] != testament_filter:
+            n_testament_filtered += 1
+            continue
 
         testament = sample["testament"].replace(" ", "-")
         book = sample["book"].replace(" ", "-")
@@ -138,6 +149,8 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_d
 
         rows.append({"audio_file": str(wav_path.resolve()), "text": sample["text"]})
 
+    if n_testament_filtered > 0:
+        print(f"  Testament filter '{testament_filter}': {len(subset) - n_testament_filtered}/{len(subset)} samples kept")
     if n_filtered > 0:
         print(f"  Filtered {n_filtered}/{len(subset)} samples exceeding {max_duration}s")
 
@@ -357,6 +370,7 @@ def prepare_language(
     workers: int,
     skip_preprocess: bool,
     tokenizer: str,
+    testament_filter: str | None = None,
 ):
     """Full preparation pipeline for one language."""
     slug = slugify(language)
@@ -366,14 +380,16 @@ def prepare_language(
     print(f"\n{'='*60}")
     print(f"Preparing: {language} ({slug})")
     print(f"Tokenizer: {tokenizer}")
+    if testament_filter:
+        print(f"Testament filter: {testament_filter}")
     print(f"{'='*60}")
 
     if dataset_base:
         print("\n[1/5] Creating metadata CSV from local data...")
-        create_metadata(language, dataset_base, data_dir, max_duration)
+        create_metadata(language, dataset_base, data_dir, max_duration, testament_filter)
     else:
         print(f"\n[1/5] Downloading from Hugging Face ({hf_repo})...")
-        download_from_huggingface(language, hf_repo, data_dir, max_duration)
+        download_from_huggingface(language, hf_repo, data_dir, max_duration, testament_filter)
 
     if not skip_preprocess:
         print("\n[2/5] Running preprocessing (prepare_csv_wavs.py)...")
@@ -419,6 +435,7 @@ def prepare_multilingual(
     workers: int,
     skip_preprocess: bool,
     tokenizer: str,
+    testament_filters: dict[str, str] | None = None,
 ):
     """Full preparation pipeline for multilingual training."""
     slug = multilingual_slug(languages)
@@ -429,6 +446,8 @@ def prepare_multilingual(
     print(f"Preparing multilingual: {', '.join(languages)}")
     print(f"Slug: {slug}")
     print(f"Tokenizer: {tokenizer}")
+    if testament_filters:
+        print(f"Testament filters: {testament_filters}")
     print(f"{'='*60}")
 
     # Step 1: Download/prepare each language
@@ -436,11 +455,12 @@ def prepare_multilingual(
     all_metadata = []
     for language in languages:
         lang_data_dir = Path("data") / slugify(language)
+        testament_filter = (testament_filters or {}).get(language)
         print(f"\n  --- {language} ---")
         if dataset_base:
-            metadata = create_metadata(language, dataset_base, lang_data_dir, max_duration)
+            metadata = create_metadata(language, dataset_base, lang_data_dir, max_duration, testament_filter)
         else:
-            metadata = download_from_huggingface(language, hf_repo, lang_data_dir, max_duration)
+            metadata = download_from_huggingface(language, hf_repo, lang_data_dir, max_duration, testament_filter)
         all_metadata.append(metadata)
 
     # Step 2: Combine metadata CSVs
@@ -574,7 +594,24 @@ def main():
         action="store_true",
         help="Skip the prepare_csv_wavs.py step (use if already preprocessed)",
     )
+    parser.add_argument(
+        "--filter-testament",
+        type=str,
+        default=None,
+        help=(
+            'JSON dict mapping language names to testament strings, e.g. \'{"Yoruba": "New Testament"}\'. '
+            "Languages not listed are not filtered. Default: use all data."
+        ),
+    )
     args = parser.parse_args()
+
+    testament_filters: dict[str, str] | None = None
+    if args.filter_testament:
+        try:
+            testament_filters = json.loads(args.filter_testament)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: --filter-testament is not valid JSON: {e}")
+            sys.exit(1)
 
     if args.dataset_base:
         base = Path(args.dataset_base)
@@ -606,6 +643,7 @@ def main():
             workers=args.workers,
             skip_preprocess=args.skip_preprocess,
             tokenizer=args.tokenizer,
+            testament_filters=testament_filters,
         )
     else:
         for lang in args.languages:
@@ -623,6 +661,7 @@ def main():
                 workers=args.workers,
                 skip_preprocess=args.skip_preprocess,
                 tokenizer=args.tokenizer,
+                testament_filter=(testament_filters or {}).get(lang),
             )
 
         if len(args.languages) > 1:
