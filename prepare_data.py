@@ -61,14 +61,33 @@ BASE_CONFIG = "F5TTS_v1_Base.yaml"
 CONFIGS_DIR = Path("src/f5_tts/configs")
 
 
-def slugify(language: str) -> str:
-    """Convert language name to a dataset slug, e.g. 'Yoruba' -> 'open-bible-yoruba'."""
-    return f"open-bible-{language.lower()}"
+TESTAMENT_SUFFIX = {
+    "New Testament": "nt",
+    "Old Testament": "ot",
+}
 
 
-def multilingual_slug(languages: list[str]) -> str:
-    """Create a slug for multilingual dataset"""
-    return "open-bible-" + "-".join(lang.lower() for lang in sorted(languages))
+def slugify(language: str, testament: str | None = None) -> str:
+    """Convert language name to a dataset slug, e.g. 'Yoruba' -> 'open-bible-yoruba'.
+    If a testament filter is provided, appends a suffix, e.g. 'open-bible-yoruba-nt'."""
+    slug = f"open-bible-{language.lower()}"
+    if testament:
+        suffix = TESTAMENT_SUFFIX.get(testament, testament.lower().replace(" ", "-"))
+        slug = f"{slug}-{suffix}"
+    return slug
+
+
+def multilingual_slug(languages: list[str], testament_filters: dict[str, str] | None = None) -> str:
+    """Create a slug for multilingual dataset, reflecting any testament filters."""
+    parts = []
+    for lang in sorted(languages):
+        testament = (testament_filters or {}).get(lang)
+        if testament:
+            suffix = TESTAMENT_SUFFIX.get(testament, testament.lower().replace(" ", "-"))
+            parts.append(f"{lang.lower()}-{suffix}")
+        else:
+            parts.append(lang.lower())
+    return "open-bible-" + "-".join(parts)
 
 
 def create_metadata(language: str, dataset_base: str, data_dir: Path, max_duration: float, testament_filter: str | None = None) -> pd.DataFrame:
@@ -373,7 +392,7 @@ def prepare_language(
     testament_filter: str | None = None,
 ):
     """Full preparation pipeline for one language."""
-    slug = slugify(language)
+    slug = slugify(language, testament_filter)
     data_dir = Path("data") / slug
     out_dir = Path("data") / f"{slug}_{tokenizer}"
 
@@ -438,7 +457,7 @@ def prepare_multilingual(
     testament_filters: dict[str, str] | None = None,
 ):
     """Full preparation pipeline for multilingual training."""
-    slug = multilingual_slug(languages)
+    slug = multilingual_slug(languages, testament_filters)
     combined_data_dir = Path("data") / slug
     out_dir = Path("data") / f"{slug}_{tokenizer}"
 
@@ -454,8 +473,8 @@ def prepare_multilingual(
     print(f"\n[1/6] Downloading {len(languages)} languages...")
     all_metadata = []
     for language in languages:
-        lang_data_dir = Path("data") / slugify(language)
         testament_filter = (testament_filters or {}).get(language)
+        lang_data_dir = Path("data") / slugify(language, testament_filter)
         print(f"\n  --- {language} ---")
         if dataset_base:
             metadata = create_metadata(language, dataset_base, lang_data_dir, max_duration, testament_filter)

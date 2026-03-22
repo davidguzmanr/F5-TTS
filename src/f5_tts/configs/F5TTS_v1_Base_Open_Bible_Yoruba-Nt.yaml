@@ -3,14 +3,14 @@ hydra:
     dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 datasets:
-  name: open-bible-ewe-igbo-yoruba  # dataset name
+  name: open-bible-yoruba-nt  # dataset name
   batch_size_per_gpu: 28000  # 8 GPUs, 8 * 38400 = 307200
   batch_size_type: frame  # frame | sample
   max_samples: 32  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
   num_workers: 4
 
 optim:
-  epochs: 204
+  epochs: 2137
   learning_rate: 7.5e-5
   num_warmup_updates: 20000  # warmup updates
   grad_accumulation_steps: 1  # note: updates = steps / grad_accumulation_steps
@@ -20,7 +20,7 @@ optim:
 model:
   name: F5TTS_v1_Base  # model name
   tokenizer: custom  # tokenizer type
-  tokenizer_path: data/open-bible-ewe-igbo-yoruba_custom/vocab.txt  # if 'custom' tokenizer, define the path want to use (should be vocab.txt)
+  tokenizer_path: data/open-bible-yoruba-nt_custom/vocab.txt  # if 'custom' tokenizer, define the path want to use (should be vocab.txt)
   backbone: DiT
   arch:
     dim: 1024
