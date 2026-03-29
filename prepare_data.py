@@ -144,10 +144,10 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_d
     ds = load_dataset(hf_repo, language)
 
     subset = ds["train"]
-    if testament:
+    if testament_filter:
         total_before = len(subset)
-        subset = subset.filter(lambda x: x["testament"] == testament)
-        print(f"  Filtered to {testament}: {len(subset)}/{total_before} samples")
+        subset = subset.filter(lambda x: x["testament"] == testament_filter)
+        print(f"  Filtered to {testament_filter}: {len(subset)}/{total_before} samples")
 
     wavs_dir = data_dir / "wavs"
     wavs_dir.mkdir(parents=True, exist_ok=True)
@@ -156,13 +156,8 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_d
 
     rows = []
     n_filtered = 0
-    n_testament_filtered = 0
     for i in tqdm(range(len(subset)), desc=f"Downloading {language} wav files"):
         sample = subset[i]
-
-        if testament_filter and sample["testament"] != testament_filter:
-            n_testament_filtered += 1
-            continue
 
         testament = sample["testament"].replace(" ", "-")
         book = sample["book"].replace(" ", "-")
@@ -182,8 +177,6 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_d
 
         rows.append({"audio_file": str(wav_path.resolve()), "text": sample["text"]})
 
-    if n_testament_filtered > 0:
-        print(f"  Testament filter '{testament_filter}': {len(subset) - n_testament_filtered}/{len(subset)} samples kept")
     if n_filtered > 0:
         print(f"  Filtered {n_filtered}/{len(subset)} samples exceeding {max_duration}s")
 
@@ -471,7 +464,8 @@ def prepare_multilingual(
     testament_filters: dict[str, str] | None = None,
 ):
     """Full preparation pipeline for multilingual training."""
-    slug = multilingual_slug(languages, testament_filters)
+    language_names = [lang for lang, _ in lang_specs]
+    slug = multilingual_slug(language_names, testament_filters)
     combined_data_dir = Path("data") / slug
     out_dir = Path("data") / f"{slug}_{tokenizer}"
 
@@ -487,7 +481,7 @@ def prepare_multilingual(
     # Step 1: Download/prepare each language
     print(f"\n[1/6] Downloading {len(lang_specs)} languages...")
     all_metadata = []
-    for language in languages:
+    for language in language_names:
         testament_filter = (testament_filters or {}).get(language)
         lang_data_dir = Path("data") / slugify(language, testament_filter)
         print(f"\n  --- {language} ---")
@@ -575,7 +569,8 @@ def prepare_finetune(
     else:
         if not source_data.exists():
             print(f"  ERROR: Source data not found: {source_data}")
-            print(f"  Run data preparation first: python prepare_data.py --languages {language}:{testament[:2].upper() if testament else ''}")
+            lang_arg = f"{language}:{TESTAMENT_SUFFIX.get(testament, testament).upper()}" if testament else language
+            print(f"  Run data preparation first: python prepare_data.py --languages {lang_arg}")
             sys.exit(1)
         finetune_data.symlink_to(source_data.resolve())
         print(f"  Symlinked: {finetune_data} -> {source_data}")
@@ -620,7 +615,7 @@ def prepare_finetune(
         f"    --max_samples {max_samples} \\\n"
         f"    --num_warmup_updates 2000 \\\n"
         f"    --save_per_updates 10000 \\\n"
-        f"    --logger wandb"
+        f"    --logger tensorboard"
     )
     print(cmd)
 
@@ -727,7 +722,35 @@ def main():
             "Languages not listed are not filtered. Default: use all data."
         ),
     )
+    parser.add_argument(
+        "--finetune",
+        action="store_true",
+        help="Finetune from a pretrained checkpoint instead of training from scratch",
+    )
+    parser.add_argument(
+        "--pretrain-ckpt",
+        type=str,
+        default=None,
+        help="Path to the pretrained model checkpoint (.pt file) to finetune from",
+    )
+    parser.add_argument(
+        "--pretrain-vocab",
+        type=str,
+        default=None,
+        help="Path to the vocab.txt file corresponding to the pretrained checkpoint",
+    )
     args = parser.parse_args()
+
+    SUFFIX_TO_TESTAMENT = {"NT": "New Testament", "OT": "Old Testament"}
+
+    lang_specs: list[tuple[str, str | None]] = []
+    for lang_arg in args.languages:
+        if ":" in lang_arg:
+            lang, suffix = lang_arg.split(":", 1)
+            testament = SUFFIX_TO_TESTAMENT.get(suffix.upper(), suffix)
+        else:
+            lang, testament = lang_arg, None
+        lang_specs.append((lang, testament))
 
     testament_filters: dict[str, str] | None = None
     if args.filter_testament:
@@ -805,7 +828,7 @@ def main():
                 workers=args.workers,
                 skip_preprocess=args.skip_preprocess,
                 tokenizer=args.tokenizer,
-                testament_filter=(testament_filters or {}).get(lang),
+                testament_filter=testament or (testament_filters or {}).get(lang),
             )
 
         if len(lang_specs) > 1:
