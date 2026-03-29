@@ -195,7 +195,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         logger=args.logger,
         wandb_project=args.dataset_name,
-        wandb_run_name=args.exp_name,
+        wandb_run_name=f"{args.exp_name}-{args.dataset_name}",
         wandb_resume_id=wandb_resume_id,
         log_samples=args.log_samples,
         last_per_updates=args.last_per_updates,
