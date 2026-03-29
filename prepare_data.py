@@ -27,6 +27,12 @@ Usage:
         --target-updates 500000 \
         --num-gpus 1 \
         --workers 4
+
+    # Finetune from a multilingual checkpoint
+    python prepare_data.py --languages Kikuyu:NT --finetune \
+        --pretrain-ckpt ckpts/F5TTS_v1_Base_vocos_custom_open-bible-chichewa-kikuyu-nt-swahili/model_last.pt \
+        --pretrain-vocab data/open-bible-chichewa-kikuyu-nt-swahili_custom/vocab.txt \
+        --num-gpus 2 --target-updates 200000 --batch-size-per-gpu 38400
 """
 
 import argparse
@@ -36,6 +42,8 @@ import subprocess
 import sys
 from io import BytesIO
 from pathlib import Path
+
+import torch
 
 import pandas as pd
 import soundfile as sf
@@ -135,10 +143,16 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_d
     print(f"  Loading {hf_repo}/{language} from Hugging Face...")
     ds = load_dataset(hf_repo, language)
 
+    subset = ds["train"]
+    if testament:
+        total_before = len(subset)
+        subset = subset.filter(lambda x: x["testament"] == testament)
+        print(f"  Filtered to {testament}: {len(subset)}/{total_before} samples")
+
     wavs_dir = data_dir / "wavs"
     wavs_dir.mkdir(parents=True, exist_ok=True)
 
-    subset = ds["train"].cast_column("audio", Audio(decode=False))
+    subset = subset.cast_column("audio", Audio(decode=False))
 
     rows = []
     n_filtered = 0
@@ -441,7 +455,7 @@ def prepare_language(
 
 
 def prepare_multilingual(
-    languages: list[str],
+    lang_specs: list[tuple[str, str | None]],
     dataset_base: str | None,
     hf_repo: str,
     max_duration: float,
@@ -461,8 +475,9 @@ def prepare_multilingual(
     combined_data_dir = Path("data") / slug
     out_dir = Path("data") / f"{slug}_{tokenizer}"
 
+    lang_labels = [f"{lang}:{t[:2].upper()}" if t else lang for lang, t in lang_specs]
     print(f"\n{'='*60}")
-    print(f"Preparing multilingual: {', '.join(languages)}")
+    print(f"Preparing multilingual: {', '.join(lang_labels)}")
     print(f"Slug: {slug}")
     print(f"Tokenizer: {tokenizer}")
     if testament_filters:
@@ -470,7 +485,7 @@ def prepare_multilingual(
     print(f"{'='*60}")
 
     # Step 1: Download/prepare each language
-    print(f"\n[1/6] Downloading {len(languages)} languages...")
+    print(f"\n[1/6] Downloading {len(lang_specs)} languages...")
     all_metadata = []
     for language in languages:
         testament_filter = (testament_filters or {}).get(language)
@@ -483,14 +498,15 @@ def prepare_multilingual(
         all_metadata.append(metadata)
 
     # Step 2: Combine metadata CSVs
-    print(f"\n[2/6] Combining metadata from {len(languages)} languages...")
+    print(f"\n[2/6] Combining metadata from {len(lang_specs)} languages...")
     combined = pd.concat(all_metadata, ignore_index=True)
     combined_data_dir.mkdir(parents=True, exist_ok=True)
     combined_csv = combined_data_dir / "metadata.csv"
     combined.to_csv(combined_csv, index=False, sep="|")
     print(f"  Combined metadata: {combined_csv} ({len(combined)} samples)")
-    for lang, meta in zip(languages, all_metadata):
-        print(f"    {lang}: {len(meta)} samples")
+    for (lang, testament), meta in zip(lang_specs, all_metadata):
+        label = f"{lang} ({testament})" if testament else lang
+        print(f"    {label}: {len(meta)} samples")
 
     # Step 3: Preprocess combined dataset
     if not skip_preprocess:
@@ -518,12 +534,101 @@ def prepare_multilingual(
     config_path = generate_config(slug, params["epochs"], batch_size_per_gpu, max_samples, num_workers, tokenizer)
 
     print(f"\n{'─'*60}")
-    print(f"Done: Multilingual ({', '.join(languages)})")
-    print(f"  Languages:   {', '.join(languages)}")
+    print(f"Done: Multilingual ({', '.join(lang_labels)})")
+    print(f"  Languages:   {', '.join(lang_labels)}")
     print(f"  Data dir:    {combined_data_dir}")
     print(f"  Prepared:    {out_dir}")
     print(f"  Config:      {config_path}")
     print(f"  Train cmd:   accelerate launch --mixed_precision bf16 src/f5_tts/train/train.py --config-name {config_path.name}")
+    print(f"{'─'*60}")
+
+
+def prepare_finetune(
+    language: str,
+    testament: str | None,
+    pretrain_ckpt: str,
+    pretrain_vocab: str,
+    target_updates: int,
+    batch_size_per_gpu: int,
+    max_samples: int,
+    num_gpus: int,
+    grad_accumulation_steps: int,
+    tokenizer: str,
+):
+    """Prepare data and weights for finetuning from a pretrained checkpoint."""
+    slug = slugify(language, testament)
+    source_data = Path("data") / f"{slug}_{tokenizer}"
+    finetune_slug = f"{slug}-finetune"
+    finetune_data = Path("data") / f"{finetune_slug}_{tokenizer}"
+    finetune_ckpt_dir = Path("ckpts") / finetune_slug
+
+    print(f"\n{'='*60}")
+    print(f"Preparing finetune: {language} ({finetune_slug})")
+    print(f"  From checkpoint: {pretrain_ckpt}")
+    print(f"  Using vocab:     {pretrain_vocab}")
+    print(f"{'='*60}")
+
+    # Step 1: Symlink mono data
+    print("\n[1/4] Symlinking preprocessed data...")
+    if finetune_data.exists() or finetune_data.is_symlink():
+        print(f"  Already exists: {finetune_data}")
+    else:
+        if not source_data.exists():
+            print(f"  ERROR: Source data not found: {source_data}")
+            print(f"  Run data preparation first: python prepare_data.py --languages {language}:{testament[:2].upper() if testament else ''}")
+            sys.exit(1)
+        finetune_data.symlink_to(source_data.resolve())
+        print(f"  Symlinked: {finetune_data} -> {source_data}")
+
+    # Step 2: Extract EMA weights
+    print("\n[2/4] Extracting EMA weights from checkpoint...")
+    finetune_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    pretrained_path = finetune_ckpt_dir / f"pretrained_{Path(pretrain_ckpt).name}"
+
+    if pretrained_path.exists():
+        print(f"  Already exists: {pretrained_path}")
+    else:
+        pretrain_ckpt_path = Path(pretrain_ckpt)
+        if not pretrain_ckpt_path.exists():
+            print(f"  ERROR: Pretrain checkpoint not found: {pretrain_ckpt}")
+            sys.exit(1)
+        ckpt = torch.load(str(pretrain_ckpt_path), map_location="cpu")
+        torch.save({"ema_model_state_dict": ckpt["ema_model_state_dict"]}, str(pretrained_path))
+        print(f"  Saved: {pretrained_path}")
+
+    # Step 3: Compute training parameters
+    print("\n[3/4] Computing training parameters...")
+    durations = load_durations(source_data)
+    params = estimate_training_params(
+        durations, batch_size_per_gpu, max_samples, num_gpus, grad_accumulation_steps, target_updates
+    )
+
+    # Step 4: Print finetune command
+    print(f"\n[4/4] Finetune command:")
+    cmd = (
+        f"accelerate launch --num_processes {num_gpus} --mixed_precision bf16 \\\n"
+        f"    src/f5_tts/train/finetune_cli.py \\\n"
+        f"    --exp_name F5TTS_v1_Base \\\n"
+        f"    --dataset_name {finetune_slug} \\\n"
+        f"    --finetune \\\n"
+        f"    --pretrain {pretrain_ckpt} \\\n"
+        f"    --tokenizer {tokenizer} \\\n"
+        f"    --tokenizer_path {pretrain_vocab} \\\n"
+        f"    --epochs {params['epochs']} \\\n"
+        f"    --learning_rate 1e-5 \\\n"
+        f"    --batch_size_per_gpu {batch_size_per_gpu} \\\n"
+        f"    --max_samples {max_samples} \\\n"
+        f"    --num_warmup_updates 2000 \\\n"
+        f"    --save_per_updates 10000 \\\n"
+        f"    --logger wandb"
+    )
+    print(cmd)
+
+    print(f"\n{'─'*60}")
+    print(f"Done: Finetune prep for {language}")
+    print(f"  Data symlink:  {finetune_data}")
+    print(f"  EMA weights:   {pretrained_path}")
+    print(f"  Epochs:        {params['epochs']}")
     print(f"{'─'*60}")
 
 
@@ -537,7 +642,7 @@ def main():
         "--languages",
         nargs="+",
         required=True,
-        help="Language names matching directories in the dataset base path (e.g. Yoruba Ewe Hausa)",
+        help="Language names, optionally with :NT or :OT suffix (e.g. Yoruba Swahili Matengo:NT)",
     )
     parser.add_argument(
         "--multilingual",
@@ -638,18 +743,38 @@ def main():
             print(f"ERROR: --dataset-base directory not found: {base}")
             sys.exit(1)
         available = [d.name for d in base.iterdir() if d.is_dir()]
-        for lang in args.languages:
+        for lang, _ in lang_specs:
             if lang not in available:
                 print(f"ERROR: Language '{lang}' not found in {args.dataset_base}")
                 print(f"  Available: {', '.join(sorted(available))}")
                 sys.exit(1)
 
-    if args.multilingual:
-        if len(args.languages) < 2:
+    if args.finetune:
+        if not args.pretrain_ckpt or not args.pretrain_vocab:
+            print("ERROR: --finetune requires --pretrain-ckpt and --pretrain-vocab")
+            sys.exit(1)
+        if len(lang_specs) != 1:
+            print("ERROR: --finetune supports exactly one language")
+            sys.exit(1)
+        lang, testament = lang_specs[0]
+        prepare_finetune(
+            language=lang,
+            testament=testament,
+            pretrain_ckpt=args.pretrain_ckpt,
+            pretrain_vocab=args.pretrain_vocab,
+            target_updates=args.target_updates,
+            batch_size_per_gpu=args.batch_size_per_gpu,
+            max_samples=args.max_samples,
+            num_gpus=args.num_gpus,
+            grad_accumulation_steps=args.grad_accumulation_steps,
+            tokenizer=args.tokenizer,
+        )
+    elif args.multilingual:
+        if len(lang_specs) < 2:
             print("ERROR: --multilingual requires at least 2 languages")
             sys.exit(1)
         prepare_multilingual(
-            languages=args.languages,
+            lang_specs=lang_specs,
             dataset_base=args.dataset_base,
             hf_repo=args.hf_repo,
             max_duration=args.max_duration,
@@ -665,7 +790,7 @@ def main():
             testament_filters=testament_filters,
         )
     else:
-        for lang in args.languages:
+        for lang, testament in lang_specs:
             prepare_language(
                 language=lang,
                 dataset_base=args.dataset_base,
@@ -683,9 +808,9 @@ def main():
                 testament_filter=(testament_filters or {}).get(lang),
             )
 
-        if len(args.languages) > 1:
+        if len(lang_specs) > 1:
             print(f"\n{'='*60}")
-            print(f"All {len(args.languages)} languages prepared successfully.")
+            print(f"All {len(lang_specs)} languages prepared successfully.")
             print(f"{'='*60}")
 
 
