@@ -116,9 +116,12 @@ def create_metadata(language: str, dataset_base: str, data_dir: Path, max_durati
         train = train[train["testament"] == testament_filter].reset_index(drop=True)
         print(f"  Testament filter '{testament_filter}': {len(train)}/{total_before} samples kept")
 
-    train = train[["filename", "text"]]
-    train.columns = ["audio_file", "text"]
+    cols = ["filename", "text"] + (["speaker_id"] if "speaker_id" in train.columns else [])
+    train = train[cols]
+    train = train.rename(columns={"filename": "audio_file"})
     train["audio_file"] = train["audio_file"].apply(lambda x: str(wav_dir / x))
+    if "speaker_id" in train.columns:
+        train["speaker_id"] = train["speaker_id"] + f"_{language}"
 
     total_before = len(train)
     if max_duration > 0:
@@ -175,7 +178,10 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_d
         if not wav_path.exists():
             sf.write(str(wav_path), audio_data, sr)
 
-        rows.append({"audio_file": str(wav_path.resolve()), "text": sample["text"]})
+        row = {"audio_file": str(wav_path.resolve()), "text": sample["text"]}
+        if "speaker_id" in sample:
+            row["speaker_id"] = f"{sample['speaker_id']}_{language}"
+        rows.append(row)
 
     if n_filtered > 0:
         print(f"  Filtered {n_filtered}/{len(subset)} samples exceeding {max_duration}s")
