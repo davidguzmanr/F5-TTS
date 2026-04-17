@@ -85,8 +85,13 @@ def slugify(language: str, testament: str | None = None) -> str:
     return slug
 
 
-def multilingual_slug(languages: list[str], testament_filters: dict[str, str] | None = None) -> str:
-    """Create a slug for multilingual dataset, reflecting any testament filters."""
+def multilingual_slug(languages: list[str], testament_filters: dict[str, str] | None = None, prepend_tag: bool = False) -> str:
+    """Create a slug for multilingual dataset, reflecting any testament filters.
+
+    When ``prepend_tag=True`` a ``-tagged`` suffix is appended so that models
+    trained with and without language-ID tokens live in separate directories
+    and get separate config files.
+    """
     parts = []
     for lang in sorted(languages):
         testament = (testament_filters or {}).get(lang)
@@ -95,7 +100,10 @@ def multilingual_slug(languages: list[str], testament_filters: dict[str, str] | 
             parts.append(f"{lang.lower()}-{suffix}")
         else:
             parts.append(lang.lower())
-    return "open-bible-" + "-".join(parts)
+    slug = "open-bible-" + "-".join(parts)
+    if prepend_tag:
+        slug += "-tagged"
+    return slug
 
 
 def create_metadata(language: str, dataset_base: str, data_dir: Path, max_duration: float, testament_filter: str | None = None, prepend_tag: bool = False) -> pd.DataFrame:
@@ -480,7 +488,7 @@ def prepare_multilingual(
 ):
     """Full preparation pipeline for multilingual training."""
     language_names = [lang for lang, _ in lang_specs]
-    slug = multilingual_slug(language_names, testament_filters)
+    slug = multilingual_slug(language_names, testament_filters, prepend_tag)
     combined_data_dir = Path("data") / slug
     out_dir = Path("data") / f"{slug}_{tokenizer}"
 
