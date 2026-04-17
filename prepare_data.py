@@ -98,7 +98,7 @@ def multilingual_slug(languages: list[str], testament_filters: dict[str, str] | 
     return "open-bible-" + "-".join(parts)
 
 
-def create_metadata(language: str, dataset_base: str, data_dir: Path, max_duration: float, testament_filter: str | None = None) -> pd.DataFrame:
+def create_metadata(language: str, dataset_base: str, data_dir: Path, max_duration: float, testament_filter: str | None = None, prepend_tag: bool = False) -> pd.DataFrame:
     """Read train.tsv and write metadata.csv in the format expected by prepare_csv_wavs.py."""
     src = Path(dataset_base) / language
     tsv_path = src / "train.tsv"
@@ -118,6 +118,10 @@ def create_metadata(language: str, dataset_base: str, data_dir: Path, max_durati
 
     cols = ["filename", "text"] + (["speaker_id"] if "speaker_id" in train.columns else [])
     train = train[cols]
+
+    if prepend_tag:
+        train["text"] = f"<|{language}|> " + train["text"]
+
     train = train.rename(columns={"filename": "audio_file"})
     train["audio_file"] = train["audio_file"].apply(lambda x: str(wav_dir / x))
     if "speaker_id" in train.columns:
@@ -139,7 +143,7 @@ def create_metadata(language: str, dataset_base: str, data_dir: Path, max_durati
     return train
 
 
-def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_duration: float, testament_filter: str | None = None) -> pd.DataFrame:
+def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_duration: float, testament_filter: str | None = None, prepend_tag: bool = False) -> pd.DataFrame:
     """Download a language dataset from Hugging Face and write wav files + metadata.csv."""
     from datasets import Audio, load_dataset
 
@@ -178,7 +182,8 @@ def download_from_huggingface(language: str, hf_repo: str, data_dir: Path, max_d
         if not wav_path.exists():
             sf.write(str(wav_path), audio_data, sr)
 
-        row = {"audio_file": str(wav_path.resolve()), "text": sample["text"]}
+        text = f"<|{language}|> {sample['text']}" if prepend_tag else sample["text"]
+        row = {"audio_file": str(wav_path.resolve()), "text": text}
         if "speaker_id" in sample:
             row["speaker_id"] = f"{sample['speaker_id']}_{language}"
         rows.append(row)
@@ -403,6 +408,7 @@ def prepare_language(
     skip_preprocess: bool,
     tokenizer: str,
     testament_filter: str | None = None,
+    prepend_tag: bool = False,
 ):
     """Full preparation pipeline for one language."""
     slug = slugify(language, testament_filter)
@@ -414,14 +420,16 @@ def prepare_language(
     print(f"Tokenizer: {tokenizer}")
     if testament_filter:
         print(f"Testament filter: {testament_filter}")
+    if prepend_tag:
+        print(f"Language tag: <|{language}|> will be prepended to each text")
     print(f"{'='*60}")
 
     if dataset_base:
         print("\n[1/5] Creating metadata CSV from local data...")
-        create_metadata(language, dataset_base, data_dir, max_duration, testament_filter)
+        create_metadata(language, dataset_base, data_dir, max_duration, testament_filter, prepend_tag)
     else:
         print(f"\n[1/5] Downloading from Hugging Face ({hf_repo})...")
-        download_from_huggingface(language, hf_repo, data_dir, max_duration, testament_filter)
+        download_from_huggingface(language, hf_repo, data_dir, max_duration, testament_filter, prepend_tag)
 
     if not skip_preprocess:
         print("\n[2/5] Running preprocessing (prepare_csv_wavs.py)...")
@@ -468,6 +476,7 @@ def prepare_multilingual(
     skip_preprocess: bool,
     tokenizer: str,
     testament_filters: dict[str, str] | None = None,
+    prepend_tag: bool = False,
 ):
     """Full preparation pipeline for multilingual training."""
     language_names = [lang for lang, _ in lang_specs]
@@ -482,6 +491,8 @@ def prepare_multilingual(
     print(f"Tokenizer: {tokenizer}")
     if testament_filters:
         print(f"Testament filters: {testament_filters}")
+    if prepend_tag:
+        print(f"Language tags: <|Language|> will be prepended to each text")
     print(f"{'='*60}")
 
     # Step 1: Download/prepare each language
@@ -492,9 +503,9 @@ def prepare_multilingual(
         lang_data_dir = Path("data") / slugify(language, testament_filter)
         print(f"\n  --- {language} ---")
         if dataset_base:
-            metadata = create_metadata(language, dataset_base, lang_data_dir, max_duration, testament_filter)
+            metadata = create_metadata(language, dataset_base, lang_data_dir, max_duration, testament_filter, prepend_tag)
         else:
-            metadata = download_from_huggingface(language, hf_repo, lang_data_dir, max_duration, testament_filter)
+            metadata = download_from_huggingface(language, hf_repo, lang_data_dir, max_duration, testament_filter, prepend_tag)
         all_metadata.append(metadata)
 
     # Step 2: Combine metadata CSVs
@@ -745,6 +756,17 @@ def main():
         default=None,
         help="Path to the vocab.txt file corresponding to the pretrained checkpoint",
     )
+    parser.add_argument(
+        "--prepend",
+        action="store_true",
+        default=False,
+        help=(
+            "Prepend a language-ID token <|Language|> to every text sample. "
+            "Enables the model to condition on the spoken language. "
+            "The token is treated as a single vocab entry — do not mix tagged and "
+            "untagged data in the same dataset."
+        ),
+    )
     args = parser.parse_args()
 
     SUFFIX_TO_TESTAMENT = {"NT": "New Testament", "OT": "Old Testament"}
@@ -817,6 +839,7 @@ def main():
             skip_preprocess=args.skip_preprocess,
             tokenizer=args.tokenizer,
             testament_filters=testament_filters,
+            prepend_tag=args.prepend,
         )
     else:
         for lang, testament in lang_specs:
@@ -835,6 +858,7 @@ def main():
                 skip_preprocess=args.skip_preprocess,
                 tokenizer=args.tokenizer,
                 testament_filter=testament or (testament_filters or {}).get(lang),
+                prepend_tag=args.prepend,
             )
 
         if len(lang_specs) > 1:

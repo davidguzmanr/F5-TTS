@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import random
 from collections import defaultdict
 from importlib.resources import files
@@ -144,11 +145,22 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
 
 # convert char to pinyin
 
+# Matches language-ID tags of the form <|SomeName|>, e.g. <|Yoruba|> or <|zh|>.
+_LANG_TAG_RE = re.compile(r"(<\|[^|>]+\|>)")
+
 
 def convert_char_to_pinyin(text_list, polyphone=True):
+    """Convert a list of strings to lists of tokens.
+
+    Language-ID tags of the form ``<|Yoruba|>`` are preserved as a single
+    atomic token so that the model can learn a dedicated embedding for them.
+    All other text is processed identically to the original behaviour:
+    Chinese characters are converted to pinyin, everything else is split
+    character-by-character.
+    """
     final_text_list = []
     custom_trans = str.maketrans(
-        {";": ",", "“": '"', "”": '"', "‘": "'", "’": "'"}
+        {";": ",", "\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"}
     )  # add custom trans here, to address oov
 
     def is_chinese(c):
@@ -156,10 +168,10 @@ def convert_char_to_pinyin(text_list, polyphone=True):
             "\u3100" <= c <= "\u9fff"  # common chinese characters
         )
 
-    for text in text_list:
-        char_list = []
-        text = text.translate(custom_trans)
-        for seg in rjieba.cut(text):
+    def _process_plain(segment: str, char_list: list) -> None:
+        """Tokenize a plain-text segment (no tags) and append tokens to char_list."""
+        segment = segment.translate(custom_trans)
+        for seg in rjieba.cut(segment):
             seg_byte_len = len(bytes(seg, "UTF-8"))
             if seg_byte_len == len(seg):  # if pure alphabets and symbols
                 if char_list and seg_byte_len > 1 and char_list[-1] not in " :'\"":
@@ -180,6 +192,21 @@ def convert_char_to_pinyin(text_list, polyphone=True):
                         char_list.extend(lazy_pinyin(c, style=Style.TONE3, tone_sandhi=True))
                     else:
                         char_list.append(c)
+
+    for text in text_list:
+        char_list = []
+        # Split on <|...|> tags, keeping the tags as separate elements.
+        # e.g. "<|Yoruba|> Hello" → ["<|Yoruba|>", " Hello"]
+        # Text without any tags produces a single-element list and the loop
+        # below follows the original code path exactly.
+        parts = _LANG_TAG_RE.split(text)
+        for part in parts:
+            if not part:
+                continue
+            if _LANG_TAG_RE.fullmatch(part):
+                char_list.append(part)  # whole tag is one atomic token
+            else:
+                _process_plain(part, char_list)
         final_text_list.append(char_list)
 
     return final_text_list
