@@ -115,6 +115,15 @@ def parse_args():
         metavar="N",
         help="Only synthesize the first N samples per language (useful for quick tests).",
     )
+    parser.add_argument(
+        "--prepend",
+        action="store_true",
+        default=False,
+        help=(
+            "Prepend <|Language|> to the reference text. Use this when the model was "
+            "trained with --prepend. Omit for models trained without language-ID tokens."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -175,6 +184,7 @@ def run_language(
     output_base: str,
     ref_index: int,
     head: int | None,
+    prepend: bool = False,
 ):
     print(f"\n{'='*60}")
     print(f"Language: {language}")
@@ -218,9 +228,11 @@ def run_language(
     ref_row = pick_reference(train, language, ref_index)
     REF_AUDIO = ref_row["audio_file"]
 
-    # The metadata text was already tagged by --prepend; strip and re-add
-    # consistently so the script works even if metadata lacks tags.
-    REF_TEXT = with_tag(language, ref_row["text"])
+    # Strip any existing tag then re-add only if the model was trained with --prepend.
+    if prepend:
+        REF_TEXT = with_tag(language, ref_row["text"])
+    else:
+        REF_TEXT = strip_tag(ref_row["text"])
 
     print(f"Reference audio : {REF_AUDIO}")
     print(f"Reference text  : {REF_TEXT}")
@@ -230,8 +242,11 @@ def run_language(
     from f5_tts.infer.utils_infer import infer_process, preprocess_ref_audio_text
 
     ref_audio, ref_text_processed = preprocess_ref_audio_text(REF_AUDIO, REF_TEXT)
-    # preprocess_ref_audio_text may normalise whitespace; re-apply tag to be safe
-    ref_text_final = with_tag(language, ref_text_processed)
+    # preprocess_ref_audio_text may normalise whitespace; re-apply tag to be safe.
+    if prepend:
+        ref_text_final = with_tag(language, ref_text_processed)
+    else:
+        ref_text_final = strip_tag(ref_text_processed)
     print(f"Final ref_text  : {ref_text_final}")
 
     # ── Batch inference ────────────────────────────────────────────────────────
@@ -248,8 +263,10 @@ def run_language(
             generated_files.append(out_path)
             continue
 
-        # The test-split text has no language tag — prepend it.
-        gen_text = with_tag(language, row["text"])
+        # ref_text_final already carries the language tag; gen_text must not add
+        # a second one so that the combined ref_text + gen_text has exactly one
+        # <|Language|> token at the very beginning, matching the training format.
+        gen_text = strip_tag(row["text"])
 
         try:
             audio_segment, final_sample_rate, _ = infer_process(
@@ -333,6 +350,7 @@ def main():
             output_base=OUTPUT_BASE,
             ref_index=args.ref_index,
             head=args.head,
+            prepend=args.prepend,
         )
         summary[language] = {"generated": n_ok, "errors": n_err}
 
